@@ -1,98 +1,142 @@
+# GreenPoints AI - Smart AI-Based Plastic Bottle Recycling System
 
-# GreenPoints - Smart AI-Based Plastic Recycling System
+GreenPoints AI (EcoPoints) is an intelligent reverse vending machine (RVM) platform powered by computer vision. It inspects deposited containers in real time, verifies that the item is a valid recyclable plastic bottle, rejects other materials (glass bottles, aluminum cans), and uses hand-detection anti-fraud protection to ensure honest deposits before awarding points.
 
-GreenPoints is a student project that explores how computer vision can support plastic bottle recycling through an AI-based recycling platform.
+---
 
-The current prototype uses a webcam to inspect objects placed on a scanning platform, detect bottles, and pause scanning when a hand is detected in the platform area.
+## Key Features
 
-## Features
+- **Two-Stage YOLO Neural Network Pipeline:**
+  - **Stage 1 (Gatekeeper - `yolo26n.pt`):** Full-frame scanning to detect generic containers (`bottle`, `can`, `cup`, `wine glass`) and detect people to eliminate false positives (e.g., shirts or body parts detected as containers).
+  - **Stage 2 (Specialist Classifier - `best.pt`):** Evaluates a cropped region of the candidate container to accurately classify the material into `plastic_bottle` (Accepted), `glass_bottle` (Rejected), or `aluminium_can` (Rejected).
+- **MediaPipe Hands Anti-Fraud Protection:**
+  - Real-time tracking of 21 3D hand landmarks.
+  - Automatically freezes point distribution and locks the deposit trapdoor if human hands are detected holding or manipulating the item.
+- **Robust Decision State Machine:**
+  - **Anti-Flicker Stability:** Bottle must remain stable for multiple consecutive frames (`STABLE_FRAMES = 8`) before awarding points.
+  - **Single Item Enforcement:** Rejects multiple items inserted simultaneously.
+  - **Platform Reset Latch:** Requires the platform to be fully cleared (`MISS_LIMIT = 5`) before the next bottle can be scanned.
+- **Multiple Camera Stream Options:**
+  - Works with standard built-in or USB webcams.
+  - Native support for **DroidCam** over Wi-Fi (stream directly from a smartphone camera) or via the DroidCam PC Virtual Webcam client.
+- **Hardware Integration Ready:**
+  - Simulated trapdoor motor timing (`DOOR_OPEN_DURATION`, `DOOR_CLOSE_DURATION`) with signals designed for serial integration with microcontrollers (ESP32 / Arduino).
+- **Live Real-Time HUD Dashboard:**
+  - Real-time user feedback showing accumulated points, trapdoor state, hand presence, and decision guidance banner.
 
-- Real-time webcam feed using OpenCV.
-- Bottle detection using the Ultralytics YOLO model.
-- Minimum bottle confidence threshold of 80%.
-- Rejection of multiple detected bottles.
-- Rejection of other detected objects on the scanning platform.
-- Hand detection using MediaPipe.
-- Pauses scanning when a hand enters the defined scanning area.
-- Point counting and session timer.
-- Simulated trapdoor opening and closing.
-- Waits for the platform to become empty before scanning the next item.
+---
 
-## Technologies Used
+## System Architecture
 
-- Python
-- Ultralytics YOLO
-- OpenCV
-- MediaPipe
-- NumPy
+```mermaid
+flowchart TD
+    Cam[Camera Stream: DroidCam / Webcam] --> Frame[Video Frame]
+    Frame --> Stage3[Stage 3: MediaPipe Hands]
+    Frame --> Stage1[Stage 1: Base YOLO yolo26n.pt]
 
-## Requirements
+    Stage3 --> HandCheck{Hands Detected?}
+    HandCheck -- Yes --> RejectHand[REJECT: Keep hands clear]
+    HandCheck -- No --> CheckCont
 
-- Python 3.12 recommended for the current development setup.
-- A working webcam.
-- Internet access for the initial installation and model download.
+    Stage1 --> ContCheck{Container Found?}
+    ContCheck -- No --> Waiting[WAITING: Place 1 bottle]
+    ContCheck -- Yes --> PersonOverlap{Overlaps Person?}
+    PersonOverlap -- Yes --> RejectOverlap[Ignore False Positive]
+    PersonOverlap -- No --> Crop[Crop Container Area]
 
-## Installation
+    Crop --> Stage2[Stage 2: Specialist YOLO best.pt]
+    Stage2 --> MatCheck{Classify Material}
 
-### 1. Clone the repository
+    MatCheck -- "glass_bottle / aluminium_can" --> RejectMat[REJECT: Wrong Material]
+    MatCheck -- "plastic_bottle" --> CheckCont{Single Container?}
+
+    CheckCont -- "Count > 1" --> RejectMulti[REJECT: One at a time]
+    CheckCont -- "Count == 1" --> StableCheck{Stable for 8 frames?}
+
+    StableCheck -- No --> HoldSteady[WAIT: Hold steady]
+    StableCheck -- Yes --> Accept[ACCEPT: +1 EcoPoint & Open Trapdoor]
+```
+
+---
+
+## Repository Structure
+
+```text
+├── weights/
+│   ├── best.pt              # Fine-tuned YOLO model for material classification
+│   └── yolo26n.pt           # Base YOLO model for container & person detection
+├── test_custom_webcam.py    # Main EcoPoints vending machine application
+├── train_greenpoints.py     # Script used to train the specialist model
+├── test_greenpoints.py      # Validation and testing script
+├── requirements.txt         # Required Python dependencies
+├── .gitignore               # Ignored files (datasets, runs, virtual environments)
+└── README.md                # Project documentation
+```
+
+---
+
+## Installation & Setup
+
+### 1. Clone the Repository
 
 ```bash
 git clone https://github.com/piyushshrestha55/GreenPoints---Smart-AI-based-Plastic-Recycling-System.git
 cd GreenPoints---Smart-AI-based-Plastic-Recycling-System
 ```
 
-### 2. Create a virtual environment
+### 2. Create and Activate a Virtual Environment
 
-Windows:
-
+**Windows (PowerShell):**
 ```powershell
 python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 ```
 
-### 3. Install dependencies
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+**macOS / Linux:**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
-### 4. Run the prototype
+### 3. Install Dependencies
 
-If the main Python file is named `greenpoints.py`:
-
-```powershell
-.\.venv\Scripts\python.exe greenpoints.py
+```bash
+pip install -r requirements.txt
 ```
 
-If the file has a different name, replace `greenpoints.py` with the actual filename.
+---
 
-Press `Q` to close the webcam window.
+## Running the Application
 
-## Model
+### Option A: Using DroidCam via Wi-Fi (Smartphone Camera)
+1. Install and launch the **DroidCam** app on your smartphone.
+2. Note the Wi-Fi IP address shown in the app (e.g. `192.168.1.50`).
+3. Run the script passing your phone's IP:
+   ```bash
+   python test_custom_webcam.py 192.168.1.50
+   ```
+   *(Alternatively, update `DROIDCAM_IP` inside `test_custom_webcam.py`)*.
 
-The prototype uses the pretrained YOLO model `yolo26n.pt`.
+### Option B: Using Built-in / USB Webcam
+Run the script with camera index `0`:
+```bash
+python test_custom_webcam.py 0
+```
 
-Ultralytics can download the model automatically when it is not present locally, provided internet access is available.
+### Controls
+- Press **Q** in the camera window to safely quit the program.
 
-## Current Limitations
+---
 
-- The standard YOLO bottle class does not reliably distinguish plastic bottles from glass bottles.
-- Hand detection may miss hands because of camera angle, lighting, or occlusion.
-- Bottle confidence alone does not establish that a bottle is empty.
-- Water-level verification is not yet implemented.
-- Trapdoor operation is simulated in software; physical motor control is not implemented.
-- Successful physical deposit is not independently verified.
+## Models & Weights
 
-This project is a prototype and requires further testing before use with physical recycling hardware.
+- **`weights/best.pt`**: Fine-tuned YOLO model trained specifically on recycled container classes (`plastic_bottle`, `glass_bottle`, `aluminium_can`).
+- **`weights/yolo26n.pt`**: Base lightweight YOLO model for initial gatekeeping and anti-false-positive filtering.
 
-## Future Improvements
+Both model weights are stored in the `weights/` directory and are ready for deployment without extra downloads.
 
-- Train a custom model for plastic bottle verification.
-- Explore empty and partially filled bottle classification.
-- Improve hand detection and scanning-area calibration.
-- Integrate an ESP32 and a physical trapdoor.
-- Add deposit verification and a persistent points database.
-- Develop a user interface for recycling sessions and points.
+---
 
-## Project Status
+## License & Project Status
 
-Student prototype under development.
+Student Prototype & Capstone Project — Designed for sustainable smart city reverse vending machine infrastructure.

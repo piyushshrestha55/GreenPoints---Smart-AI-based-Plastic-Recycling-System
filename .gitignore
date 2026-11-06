@@ -1,0 +1,35 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache & compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Large Archives & Datasets (never commit to git)
+*.zip
+*.tar
+*.gz
+*.rar
+datasets/
+archive (1).zip
+
+# YOLO Training outputs and runs (weights/best.pt is tracked directly in weights/)
+runs/
+
+# IDE / Editor configuration
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Temporary scratch and debugging scripts
+test_combined.py
+check_leakage.py
+val_conf50.py
+/yolo26n.pt
