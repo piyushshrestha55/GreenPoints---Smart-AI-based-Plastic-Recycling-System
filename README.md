@@ -63,10 +63,12 @@ flowchart TD
 
 ```text
 ├── weights/
-│   ├── best.pt              # Fine-tuned YOLO model for material classification
+│   ├── best.pt              # Fine-tuned YOLO model (v2) for material classification
 │   └── yolo26n.pt           # Base YOLO model for container & person detection
-├── test_custom_webcam.py    # Main EcoPoints vending machine application
-├── train_greenpoints.py     # Script used to train the specialist model
+├── test_custom_webcam.py    # Main EcoPoints vending machine application (HUD & logic)
+├── test_model.py            # Standalone webcam script to test YOLO detection directly
+├── train_v2.py              # Transfer learning & fine-tuning script (v2 pipeline)
+├── train_greenpoints.py     # Initial specialist model training script
 ├── test_greenpoints.py      # Validation and testing script
 ├── requirements.txt         # Required Python dependencies
 ├── .gitignore               # Ignored files (datasets, runs, virtual environments)
@@ -118,9 +120,17 @@ pip install -r requirements.txt
    *(Alternatively, update `DROIDCAM_IP` inside `test_custom_webcam.py`)*.
 
 ### Option B: Using Built-in / USB Webcam
-Run the script with camera index `0`:
+Run the script with your camera index (e.g., `0` for default laptop webcam, or `1` for external/virtual webcam):
 ```bash
 python test_custom_webcam.py 0
+# or
+python test_custom_webcam.py 1
+```
+
+### Option C: Quick Model Verification (Standalone Predictor)
+To quickly test the raw detection predictions of `best.pt` without the HUD and anti-fraud state machine:
+```bash
+python test_model.py
 ```
 
 ### Controls
@@ -128,10 +138,31 @@ python test_custom_webcam.py 0
 
 ---
 
+## Training & Fine-Tuning Pipeline
+
+### v2 Transfer-Learning Fine-Tuning (`train_v2.py`)
+To adapt the detector to new webcam lighting conditions and real-world camera angles while retaining previous learning:
+- **Base Checkpoint:** Boots directly from previously trained weights (`weights/best.pt`).
+- **Dataset:** Combines the core 1,100 dataset images with real-world augmented webcam samples (`datasets/greenpoints_v2/data.yaml`).
+- **Optimization Strategy:**
+  - Conservative base learning rate (`lr0 = 0.0001`) to eliminate catastrophic forgetting.
+  - Early stopping with patience (`patience = 15`) across 50 epochs.
+  - Disk-backed feature caching and GPU multi-threading (`batch = 16`, `workers = 4`).
+
+Run fine-tuning:
+```bash
+python train_v2.py
+```
+
+---
+
 ## Models & Weights
 
-- **`weights/best.pt`**: Fine-tuned YOLO model trained specifically on recycled container classes (`plastic_bottle`, `glass_bottle`, `aluminium_can`).
-- **`weights/yolo26n.pt`**: Base lightweight YOLO model for initial gatekeeping and anti-false-positive filtering.
+- **`weights/best.pt`**: Latest **v2 fine-tuned YOLO model** specialized for material identification:
+  - Classes: `plastic_bottle` (Accepted), `glass_bottle` (Rejected), `aluminium_can` (Rejected)
+  - Performance: **~99.2% mAP@50**, **99.0% Precision**, **98.2% Recall**
+  - Robust against challenging webcam glare, labels, and varied container angles.
+- **`weights/yolo26n.pt`**: Base lightweight YOLO model for initial container gatekeeping and human presence/false-positive filtering.
 
 Both model weights are stored in the `weights/` directory and are ready for deployment without extra downloads.
 

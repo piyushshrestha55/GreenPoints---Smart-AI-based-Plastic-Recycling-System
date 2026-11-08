@@ -24,7 +24,7 @@ CAMERA_SOURCE = 1
 # - BASE_WEIGHTS: Pretrained COCO model used to detect general containers & people
 # - CUSTOM_WEIGHTS: Fine-tuned model specifically trained to classify container materials
 BASE_WEIGHTS = "weights/yolo26n.pt" if os.path.exists("weights/yolo26n.pt") else "yolo26n.pt"
-CUSTOM_WEIGHTS = "weights/best.pt" if os.path.exists("weights/best.pt") else r"runs/detect/runs/greenpoints/yolo26n_v1/weights/best.pt"
+CUSTOM_WEIGHTS = "weights/best.pt" if os.path.exists("weights/best.pt") else r"runs/detect/greenpoints_v2_finetuned-3/weights/best.pt" 
 
 # Anti-flicker / stability requirements:
 # - STABLE_FRAMES: How many consecutive frames the bottle must be seen before accepting
