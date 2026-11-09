@@ -402,6 +402,9 @@ def main():
 
         # C. TRAPDOOR IS CLOSED: Active scanning and validation rules
         else:
+            if container_count >= 1 or hand_detected:
+                misses = 0
+
             if hand_detected:
                 # --------------------------------------------------------------
                 # RULE 1: HAND DETECTED -> REJECT
