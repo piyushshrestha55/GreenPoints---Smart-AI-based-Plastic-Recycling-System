@@ -28,6 +28,9 @@ runs/
 *.swo
 .DS_Store
 
+# Training data logs and failure cases
+logs/
+
 # Temporary scratch and debugging scripts
 test_combined.py
 check_leakage.py

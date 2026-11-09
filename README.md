@@ -66,12 +66,13 @@ flowchart TD
 │   ├── best.pt              # Fine-tuned YOLO model (v2) for material classification
 │   └── yolo26n.pt           # Base YOLO model for container & person detection
 ├── test_custom_webcam.py    # Main EcoPoints vending machine application (HUD & logic)
-├── test_model.py            # Standalone webcam script to test YOLO detection directly
+├── predict_webcam.py        # Standalone webcam script to test YOLO detection directly
 ├── train_v2.py              # Transfer learning & fine-tuning script (v2 pipeline)
 ├── train_greenpoints.py     # Initial specialist model training script
-├── test_greenpoints.py      # Validation and testing script
+├── eval_greenpoints.py      # Validation and evaluation script
+├── old/                     # Archived legacy scripts (greenpoints.py)
 ├── requirements.txt         # Required Python dependencies
-├── .gitignore               # Ignored files (datasets, runs, virtual environments)
+├── .gitignore               # Ignored files (datasets, runs, logs, virtual environments)
 └── README.md                # Project documentation
 ```
 
@@ -130,7 +131,7 @@ python test_custom_webcam.py 1
 ### Option C: Quick Model Verification (Standalone Predictor)
 To quickly test the raw detection predictions of `best.pt` without the HUD and anti-fraud state machine:
 ```bash
-python test_model.py
+python predict_webcam.py
 ```
 
 ### Controls

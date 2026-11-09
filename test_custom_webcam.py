@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import cv2
+import numpy as np
 import torch
 import mediapipe as mp
 from ultralytics import YOLO
@@ -35,11 +36,21 @@ MISS_LIMIT = 5
 # Confidence thresholds:
 # - BASE_CONF: Minimum confidence for base YOLO to identify a container or person (25%)
 # - CUSTOM_CONF: Minimum confidence for custom model to identify the material (50%)
+# - ACCEPT_CONF: Minimum confidence for plastic bottle acceptance streak (80%)
 BASE_CONF = 0.25
 CUSTOM_CONF = 0.50
+ACCEPT_CONF = 0.80
 
 # Generic container classes recognized by the base COCO model
 CONTAINER_LABELS = {"bottle", "can", "cup", "wine glass"}
+
+# Model agreement policy:
+# - If True, candidate must be classified as "bottle" by Stage 1 to be accepted as plastic_bottle
+REQUIRE_BASE_BOTTLE = True
+
+# Fallback execution frequency:
+# - Run full-frame Stage 2 fallback only every N frames to save compute on empty frames
+FALLBACK_EVERY_N_FRAMES = 5
 
 # Recycling policy:
 # - Only plastic bottles earn points and open the trapdoor
@@ -60,10 +71,34 @@ CLASS_COLORS = {
     "plastic_bottle": (80, 220, 80),   # Green (Accepted material)
 }
 
+# Platform scanning area (Region of Interest):
+# - Set to False to disable platform ROI filtering
+USE_PLATFORM_ROI = True
+# Coordinates are percentages of the camera frame (x, y):
+PLATFORM_POLYGON = [
+    (0.15, 0.30),
+    (0.85, 0.30),
+    (0.95, 0.95),
+    (0.05, 0.95),
+]
+
 
 # ==============================================================================
 # HELPER FUNCTIONS
 # ==============================================================================
+
+def get_platform_polygon(frame):
+    """Computes pixel polygon vertices for the platform area from frame dimensions."""
+    height, width = frame.shape[:2]
+    return np.array([
+        [int(x * width), int(y * height)]
+        for x, y in PLATFORM_POLYGON
+    ], dtype=np.int32)
+
+
+def is_inside_platform(x, y, polygon):
+    """Checks whether a given pixel coordinate (x, y) is inside the platform polygon."""
+    return cv2.pointPolygonTest(polygon, (float(x), float(y)), False) >= 0
 
 def overlaps_person(box, person_boxes, threshold=0.5):
     """
@@ -149,6 +184,30 @@ def draw_label(frame, text, origin, bg_color, text_color=(0, 0, 0)):
     cv2.putText(frame, text, (x + 4, y - 4), font, scale, text_color, thickness, cv2.LINE_AA)
 
 
+# Logging setup for retraining and audit
+LOGS_DIR = "logs"
+LOG_EVENTS_CSV = os.path.join(LOGS_DIR, "events.csv")
+LOG_RATE_LIMIT = 1.0  # Rate-limit automatic event logging to at most 1 save per second
+
+
+def log_event(frame, event, item_class, confidence, base_label, hand_detected):
+    """
+    Saves the full camera frame to logs/<event>/<timestamp>.jpg and appends
+    metadata to logs/events.csv for active learning, retraining, and failure audit.
+    """
+    event_dir = os.path.join(LOGS_DIR, event)
+    os.makedirs(event_dir, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S") + f"_{int((time.time() % 1) * 1000):03d}"
+    img_path = os.path.join(event_dir, f"{ts}.jpg")
+    cv2.imwrite(img_path, frame)
+
+    csv_exists = os.path.exists(LOG_EVENTS_CSV)
+    with open(LOG_EVENTS_CSV, mode="a", encoding="utf-8") as f:
+        if not csv_exists:
+            f.write("timestamp,event,class,confidence,base_label,hand_detected\n")
+        f.write(f"{ts},{event},{item_class},{confidence:.4f},{base_label},{hand_detected}\n")
+
+
 # ==============================================================================
 # MAIN APPLICATION
 # ==============================================================================
@@ -225,6 +284,9 @@ def main():
     streak_cls = None                    # Class ID of current stable item being held
     streak = 0                           # Consecutive frames this same item class was detected
     misses = 0                           # Consecutive frames where no containers were detected (empty platform)
+    frame_count = 0                      # Frame index counter for periodic fallback
+    last_fallback_candidates = []        # Cached fallback detections between checks
+    last_log_time = 0.0                  # Rate-limiting timestamp for event dataset logging
 
     # --------------------------------------------------------------------------
     # MAIN VIDEO PROCESSING LOOP
@@ -235,9 +297,17 @@ def main():
             print("Cannot read webcam frame.")
             break
 
+        frame_count += 1
         h, w = frame.shape[:2]
         display = frame.copy()
         current_time = time.time()
+        platform_poly = get_platform_polygon(frame) if USE_PLATFORM_ROI else None
+
+        # Draw platform ROI polygon on screen
+        if USE_PLATFORM_ROI and platform_poly is not None:
+            cv2.polylines(display, [platform_poly], isClosed=True, color=(255, 200, 0), thickness=2)
+            cv2.putText(display, "PLATFORM ROI", (platform_poly[0][0], max(25, platform_poly[0][1] - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1, cv2.LINE_AA)
 
         # ----------------------------------------------------------------------
         # STAGE 1: GATEKEEPER (Base YOLO on full frame)
@@ -264,6 +334,11 @@ def main():
                     # Keep track of person locations to filter out overlapping containers
                     person_boxes.append((x1, y1, x2, y2))
                 elif label in CONTAINER_LABELS:
+                    # Platform ROI filter: only consider candidates centered inside polygon
+                    cx = (x1 + x2) / 2.0
+                    cy = (y1 + y2) / 2.0
+                    if USE_PLATFORM_ROI and not is_inside_platform(cx, cy, platform_poly):
+                        continue
                     # Generic container candidate found
                     candidate_boxes.append(((x1, y1, x2, y2), label, float(b.conf[0])))
 
@@ -307,36 +382,49 @@ def main():
                     "conf": mat_conf,
                     "area": (x2 - x1) * (y2 - y1),
                     "source": f"Crop ({base_label}->{mat_name})",
+                    "base_label": base_label,
                 })
 
         # Fallback for aluminium cans:
         # Since standard COCO does not have an "aluminium can" class, if Stage 1 found no containers,
         # run custom model directly on the full frame at higher confidence (0.60) to look for cans.
+        # Run only every FALLBACK_EVERY_N_FRAMES to save compute on empty frames, reusing cached results.
         if len(classified_candidates) == 0:
-            custom_full_res = model_custom.predict(
-                source=frame,
-                conf=0.60,
-                imgsz=640,
-                device=device,
-                verbose=False,
-            )[0]
+            if frame_count % FALLBACK_EVERY_N_FRAMES == 0:
+                last_fallback_candidates = []
+                custom_full_res = model_custom.predict(
+                    source=frame,
+                    conf=0.60,
+                    imgsz=640,
+                    device=device,
+                    verbose=False,
+                )[0]
 
-            if custom_full_res.boxes is not None and len(custom_full_res.boxes) > 0:
-                for cb in custom_full_res.boxes:
-                    cls_id = int(cb.cls[0])
-                    mat_name = model_custom.names[cls_id]
-                    coords = tuple(map(int, cb.xyxy[0].tolist()))
+                if custom_full_res.boxes is not None and len(custom_full_res.boxes) > 0:
+                    for cb in custom_full_res.boxes:
+                        cls_id = int(cb.cls[0])
+                        mat_name = model_custom.names[cls_id]
+                        coords = tuple(map(int, cb.xyxy[0].tolist()))
 
-                    if mat_name == "aluminium_can" and not overlaps_person(coords, person_boxes):
-                        x1, y1, x2, y2 = coords
-                        classified_candidates.append({
-                            "box": coords,
-                            "cls_id": cls_id,
-                            "name": mat_name,
-                            "conf": float(cb.conf[0]),
-                            "area": (x2 - x1) * (y2 - y1),
-                            "source": "Stage 2 Direct (AluCan)",
-                        })
+                        if mat_name == "aluminium_can" and not overlaps_person(coords, person_boxes):
+                            x1, y1, x2, y2 = coords
+                            cx = (x1 + x2) / 2.0
+                            cy = (y1 + y2) / 2.0
+                            if USE_PLATFORM_ROI and not is_inside_platform(cx, cy, platform_poly):
+                                continue
+                            last_fallback_candidates.append({
+                                "box": coords,
+                                "cls_id": cls_id,
+                                "name": mat_name,
+                                "conf": float(cb.conf[0]),
+                                "area": (x2 - x1) * (y2 - y1),
+                                "source": "Stage 2 Direct (AluCan)",
+                                "base_label": "can",
+                            })
+            # Reuse last fallback candidates during intermediate frames
+            classified_candidates.extend(last_fallback_candidates)
+        else:
+            last_fallback_candidates = []
 
         # ----------------------------------------------------------------------
         # STAGE 3: HAND DETECTION (MediaPipe Anti-Fraud)
@@ -344,7 +432,22 @@ def main():
         # ----------------------------------------------------------------------
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         hand_results = hands_detector.process(rgb_frame)
-        hand_detected = bool(hand_results.multi_hand_landmarks and len(hand_results.multi_hand_landmarks) > 0)
+        hand_detected = False
+
+        if hand_results.multi_hand_landmarks:
+            if USE_PLATFORM_ROI and platform_poly is not None:
+                # Check if any hand landmark is inside the platform polygon
+                for hand_landmarks in hand_results.multi_hand_landmarks:
+                    for lm in hand_landmarks.landmark:
+                        lx = int(lm.x * w)
+                        ly = int(lm.y * h)
+                        if is_inside_platform(lx, ly, platform_poly):
+                            hand_detected = True
+                            break
+                    if hand_detected:
+                        break
+            else:
+                hand_detected = len(hand_results.multi_hand_landmarks) > 0
 
         # Visual feedback: Highlight detected hands in red so user knows hands are not allowed
         if hand_detected:
@@ -427,6 +530,12 @@ def main():
                 status_text = f"MULTIPLE ITEMS ({container_count}) - Please insert one at a time!"
                 status_color = (0, 140, 255)  # Orange
                 trapdoor_state = "CLOSED"
+                if current_time - last_log_time >= LOG_RATE_LIMIT:
+                    classes_str = "+".join(c["name"] for c in classified_candidates[:3])
+                    max_conf = max(c["conf"] for c in classified_candidates)
+                    base_str = "+".join(str(c.get("base_label", "none")) for c in classified_candidates[:3])
+                    log_event(frame, "rejected_multiple", classes_str, max_conf, base_str, hand_detected)
+                    last_log_time = current_time
                 # TODO: Send REJECT signal to ESP32
 
             elif container_count == 1:
@@ -434,46 +543,69 @@ def main():
                 target = classified_candidates[0]
                 mat_name = target["name"]
                 mat_conf = target["conf"]
-
-                # Stability counter: Ensure the container is resting steadily and class isn't flickering
-                if target["cls_id"] == streak_cls:
-                    streak += 1
-                else:
-                    streak_cls = target["cls_id"]
-                    streak = 1
+                base_label = target.get("base_label", "unknown")
 
                 # --------------------------------------------------------------
-                # RULE 3: CHECK MATERIAL TYPE
+                # RULE 3: CHECK MATERIAL TYPE & CONFIDENCE THRESHOLD
                 # --------------------------------------------------------------
                 if mat_name == ACCEPTED_MATERIAL:
-                    # Accepted plastic bottle
-                    if streak >= STABLE_FRAMES:
-                        if not item_processed:
-                            # --------------------------------------------------
-                            # ACCEPT: 0 hands + 1 stable plastic bottle
-                            # Award 1 point and trigger trapdoor open
-                            # --------------------------------------------------
-                            points += POINTS_PER_ITEM
-                            trapdoor_state = "OPEN"
-                            door_timer_start = current_time
-                            point_word = "Point" if POINTS_PER_ITEM == 1 else "Points"
-                            status_text = f"VALID: {mat_name.upper()}! +{POINTS_PER_ITEM} {point_word} Awarded"
-                            status_color = (0, 255, 0)
-                            print(f"[ESP32] ACCEPT SIGNAL -> OPEN_TRAPDOOR | Points: +{POINTS_PER_ITEM} (Total: {points})")
-                            # TODO: Send ACCEPT signal to ESP32 to open trapdoor
-                        else:
-                            status_text = "BOTTLE ACCEPTED - Platform reset"
-                            status_color = (0, 200, 100)
+                    if REQUIRE_BASE_BOTTLE and base_label != "bottle":
+                        # REJECT: Both models must agree; Stage 1 did not detect a bottle
+                        streak = 0
+                        streak_cls = None
+                        status_text = f"REJECT: Not a bottle ({base_label})"
+                        status_color = (0, 0, 255)  # Red
+                        trapdoor_state = "CLOSED"
+                        if current_time - last_log_time >= LOG_RATE_LIMIT:
+                            log_event(frame, "rejected_material", mat_name, mat_conf, base_label, hand_detected)
+                            last_log_time = current_time
+                    elif mat_conf < ACCEPT_CONF:
+                        # Confidence between CUSTOM_CONF (0.50) and ACCEPT_CONF (0.80)
+                        streak = 0
+                        streak_cls = None
+                        status_text = "LOW CONFIDENCE - reposition bottle"
+                        status_color = (0, 200, 255)  # Amber/Yellow
                     else:
-                        # Bottle is valid, but waiting to verify it is held steady
-                        status_text = f"HOLD STEADY {streak}/{STABLE_FRAMES} ({mat_name})"
-                        status_color = (0, 255, 255)  # Yellow
+                        # Stability counter: Only count streak when confidence >= ACCEPT_CONF
+                        if target["cls_id"] == streak_cls:
+                            streak += 1
+                        else:
+                            streak_cls = target["cls_id"]
+                            streak = 1
+
+                        if streak >= STABLE_FRAMES:
+                            if not item_processed:
+                                # --------------------------------------------------
+                                # ACCEPT: 0 hands + 1 stable plastic bottle
+                                # Award 1 point and trigger trapdoor open
+                                # --------------------------------------------------
+                                points += POINTS_PER_ITEM
+                                trapdoor_state = "OPEN"
+                                door_timer_start = current_time
+                                point_word = "Point" if POINTS_PER_ITEM == 1 else "Points"
+                                status_text = f"VALID: {mat_name.upper()}! +{POINTS_PER_ITEM} {point_word} Awarded"
+                                status_color = (0, 255, 0)
+                                print(f"[ESP32] ACCEPT SIGNAL -> OPEN_TRAPDOOR | Points: +{POINTS_PER_ITEM} (Total: {points})")
+                                if current_time - last_log_time >= LOG_RATE_LIMIT:
+                                    log_event(frame, "accepted", mat_name, mat_conf, base_label, hand_detected)
+                                    last_log_time = current_time
+                                # TODO: Send ACCEPT signal to ESP32 to open trapdoor
+                            else:
+                                status_text = "BOTTLE ACCEPTED - Platform reset"
+                                status_color = (0, 200, 100)
+                        else:
+                            # Bottle is valid, but waiting to verify it is held steady
+                            status_text = f"HOLD STEADY {streak}/{STABLE_FRAMES} ({mat_name})"
+                            status_color = (0, 255, 255)  # Yellow
                 else:
                     # REJECT: Invalid material (e.g. glass bottle or aluminium can)
                     streak = 0
                     streak_cls = None
                     status_text = f"REJECT: Material Not Accepted ({mat_name}) - Trapdoor Locked"
                     status_color = (0, 0, 255)  # Red
+                    if current_time - last_log_time >= LOG_RATE_LIMIT:
+                        log_event(frame, "rejected_material", mat_name, mat_conf, base_label, hand_detected)
+                        last_log_time = current_time
                     # TODO: Send REJECT signal to ESP32
 
             else:
@@ -511,9 +643,16 @@ def main():
         cv2.putText(display, status_text, (25, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.65, status_color, 2, cv2.LINE_AA)
 
         # Show live video window
-        cv2.imshow("GreenPoints AI - Anti-Fraud & Two-Stage Pipeline (Q to quit)", display)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        cv2.imshow("GreenPoints AI - Anti-Fraud & Two-Stage Pipeline (Q to quit, W to log wrong)", display)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
             break
+        elif key == ord("w"):
+            w_class = classified_candidates[0]["name"] if container_count >= 1 else "none"
+            w_conf = classified_candidates[0]["conf"] if container_count >= 1 else 0.0
+            w_base = classified_candidates[0].get("base_label", "none") if container_count >= 1 else "none"
+            log_event(frame, "wrong", w_class, w_conf, w_base, hand_detected)
+            print(f"[LOG] Manually recorded incorrect decision frame -> logs/wrong/ ({w_class}, {w_conf:.2f})")
 
     # --------------------------------------------------------------------------
     # CLEANUP & SHUTDOWN

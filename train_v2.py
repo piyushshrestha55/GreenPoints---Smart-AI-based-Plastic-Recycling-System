@@ -19,8 +19,8 @@ def main():
         # Early stopping: if the model doesn't improve for 15 epochs in a row, stop early.
         patience=15,
         
-        # INCREASED BATCH SIZE: Feeds 32 images at a time instead of 8.
-        # This forces your RTX 4050 (6GB VRAM) to work harder and process epochs much faster.
+        # BATCH SIZE: Feeds 16 images at a time.
+        # Tuned for RTX 4050 (6GB VRAM) balance of speed and stability.
         batch=16,
         
         # Standardizes all images to 640x640 pixels (matches your Roboflow preprocessing).
@@ -29,16 +29,16 @@ def main():
         # device=0 tells the script to use your primary NVIDIA GPU instead of the CPU.
         device=0,
         
-        # Keep at 0 for Windows to prevent multi-threading crashes during data loading.
-        # CHANGE TO 4 (Pre-fetches images in the background)
+        # Multi-process data loading workers (4 pre-fetches images efficiently).
         workers=4,         
         
         # CHANGE TO "disk" (Caches processed images to your drive)
         cache="disk",        
         
-        # CRITICAL: A very low learning rate (0.0001). 
+        # CRITICAL: A very low learning rate (0.0001) with AdamW optimizer. 
         # This tells the AI to make only *tiny* adjustments for the new webcam lighting 
         # without accidentally "forgetting" the original 1100 images.
+        optimizer="AdamW",
         lr0=0.0001,  
         
         # Saves this new training run in a separate folder so your old model isn't overwritten.
