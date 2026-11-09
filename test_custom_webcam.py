@@ -47,6 +47,14 @@ CONTAINER_LABELS = {"bottle", "can", "cup", "wine glass"}
 # Model agreement policy:
 # - If True, candidate must be classified as "bottle" by Stage 1 to be accepted as plastic_bottle
 REQUIRE_BASE_BOTTLE = True
+# - False negative mitigation: COCO sometimes mislabels bottles as "cup".
+#   If ALLOW_CUP_OVERRIDE is True and specialist confidence is very high (>= 90%), allow it.
+ALLOW_CUP_OVERRIDE = True
+ALLOW_CUP_HIGH_CONF = 0.90
+
+# Anti-flicker confidence tolerance:
+# - Number of consecutive frames allowed to dip below ACCEPT_CONF (into 0.50-0.79) without resetting streak to 0
+MAX_WEAK_FRAMES = 2
 
 # Fallback execution frequency:
 # - Run full-frame Stage 2 fallback only every N frames to save compute on empty frames
@@ -72,9 +80,11 @@ CLASS_COLORS = {
 }
 
 # Platform scanning area (Region of Interest):
-# - Set to False to disable platform ROI filtering
+# - Set USE_PLATFORM_ROI = False to disable region filtering during bench testing
 USE_PLATFORM_ROI = True
-# Coordinates are percentages of the camera frame (x, y):
+# Coordinates are percentages (0.0 to 1.0) of camera frame (x, y):
+# Order: [(top-left), (top-right), (bottom-right), (bottom-left)]
+# CALIBRATION: Adjust these points to align with the yellow outline of your physical tray/box.
 PLATFORM_POLYGON = [
     (0.15, 0.30),
     (0.85, 0.30),
@@ -187,7 +197,6 @@ def draw_label(frame, text, origin, bg_color, text_color=(0, 0, 0)):
 # Logging setup for retraining and audit
 LOGS_DIR = "logs"
 LOG_EVENTS_CSV = os.path.join(LOGS_DIR, "events.csv")
-LOG_RATE_LIMIT = 1.0  # Rate-limit automatic event logging to at most 1 save per second
 
 
 def log_event(frame, event, item_class, confidence, base_label, hand_detected):
@@ -283,10 +292,11 @@ def main():
 
     streak_cls = None                    # Class ID of current stable item being held
     streak = 0                           # Consecutive frames this same item class was detected
+    weak_frames = 0                      # Consecutive frames of confidence below ACCEPT_CONF
     misses = 0                           # Consecutive frames where no containers were detected (empty platform)
     frame_count = 0                      # Frame index counter for periodic fallback
     last_fallback_candidates = []        # Cached fallback detections between checks
-    last_log_time = 0.0                  # Rate-limiting timestamp for event dataset logging
+    last_logged_event = None             # Tracks last logged event type to save once per item encounter
 
     # --------------------------------------------------------------------------
     # MAIN VIDEO PROCESSING LOOP
@@ -515,6 +525,7 @@ def main():
                 # --------------------------------------------------------------
                 streak = 0
                 streak_cls = None
+                weak_frames = 0
                 status_text = "HAND DETECTED - NO POINTS GIVEN! (Keep hands clear)"
                 status_color = (0, 0, 255)  # Red
                 trapdoor_state = "CLOSED"
@@ -527,15 +538,16 @@ def main():
                 # --------------------------------------------------------------
                 streak = 0
                 streak_cls = None
+                weak_frames = 0
                 status_text = f"MULTIPLE ITEMS ({container_count}) - Please insert one at a time!"
                 status_color = (0, 140, 255)  # Orange
                 trapdoor_state = "CLOSED"
-                if current_time - last_log_time >= LOG_RATE_LIMIT:
+                if last_logged_event != "rejected_multiple":
                     classes_str = "+".join(c["name"] for c in classified_candidates[:3])
                     max_conf = max(c["conf"] for c in classified_candidates)
                     base_str = "+".join(str(c.get("base_label", "none")) for c in classified_candidates[:3])
                     log_event(frame, "rejected_multiple", classes_str, max_conf, base_str, hand_detected)
-                    last_log_time = current_time
+                    last_logged_event = "rejected_multiple"
                 # TODO: Send REJECT signal to ESP32
 
             elif container_count == 1:
@@ -549,23 +561,33 @@ def main():
                 # RULE 3: CHECK MATERIAL TYPE & CONFIDENCE THRESHOLD
                 # --------------------------------------------------------------
                 if mat_name == ACCEPTED_MATERIAL:
-                    if REQUIRE_BASE_BOTTLE and base_label != "bottle":
+                    # Model agreement check (with high-confidence cup override)
+                    is_valid_bottle = (base_label == "bottle") or (
+                        ALLOW_CUP_OVERRIDE and base_label == "cup" and mat_conf >= ALLOW_CUP_HIGH_CONF
+                    )
+                    if REQUIRE_BASE_BOTTLE and not is_valid_bottle:
                         # REJECT: Both models must agree; Stage 1 did not detect a bottle
                         streak = 0
                         streak_cls = None
+                        weak_frames = 0
                         status_text = f"REJECT: Not a bottle ({base_label})"
                         status_color = (0, 0, 255)  # Red
                         trapdoor_state = "CLOSED"
-                        if current_time - last_log_time >= LOG_RATE_LIMIT:
+                        if last_logged_event != "rejected_material":
                             log_event(frame, "rejected_material", mat_name, mat_conf, base_label, hand_detected)
-                            last_log_time = current_time
+                            last_logged_event = "rejected_material"
                     elif mat_conf < ACCEPT_CONF:
                         # Confidence between CUSTOM_CONF (0.50) and ACCEPT_CONF (0.80)
-                        streak = 0
-                        streak_cls = None
-                        status_text = "LOW CONFIDENCE - reposition bottle"
+                        # Allow up to MAX_WEAK_FRAMES before resetting streak to 0
+                        weak_frames += 1
+                        if weak_frames > MAX_WEAK_FRAMES:
+                            streak = 0
+                            streak_cls = None
+                        status_text = f"LOW CONFIDENCE ({mat_conf:.2f}) - reposition bottle"
                         status_color = (0, 200, 255)  # Amber/Yellow
                     else:
+                        # Confirmed high-confidence detection: reset weak frame counter
+                        weak_frames = 0
                         # Stability counter: Only count streak when confidence >= ACCEPT_CONF
                         if target["cls_id"] == streak_cls:
                             streak += 1
@@ -586,9 +608,9 @@ def main():
                                 status_text = f"VALID: {mat_name.upper()}! +{POINTS_PER_ITEM} {point_word} Awarded"
                                 status_color = (0, 255, 0)
                                 print(f"[ESP32] ACCEPT SIGNAL -> OPEN_TRAPDOOR | Points: +{POINTS_PER_ITEM} (Total: {points})")
-                                if current_time - last_log_time >= LOG_RATE_LIMIT:
-                                    log_event(frame, "accepted", mat_name, mat_conf, base_label, hand_detected)
-                                    last_log_time = current_time
+                                # Always record valid accepted bottles immediately
+                                log_event(frame, "accepted", mat_name, mat_conf, base_label, hand_detected)
+                                last_logged_event = "accepted"
                                 # TODO: Send ACCEPT signal to ESP32 to open trapdoor
                             else:
                                 status_text = "BOTTLE ACCEPTED - Platform reset"
@@ -601,11 +623,12 @@ def main():
                     # REJECT: Invalid material (e.g. glass bottle or aluminium can)
                     streak = 0
                     streak_cls = None
+                    weak_frames = 0
                     status_text = f"REJECT: Material Not Accepted ({mat_name}) - Trapdoor Locked"
                     status_color = (0, 0, 255)  # Red
-                    if current_time - last_log_time >= LOG_RATE_LIMIT:
+                    if last_logged_event != "rejected_material":
                         log_event(frame, "rejected_material", mat_name, mat_conf, base_label, hand_detected)
-                        last_log_time = current_time
+                        last_logged_event = "rejected_material"
                     # TODO: Send REJECT signal to ESP32
 
             else:
@@ -615,7 +638,9 @@ def main():
                 if misses >= MISS_LIMIT:
                     streak = 0
                     streak_cls = None
+                    weak_frames = 0
                     item_processed = False  # Reset latch: ready for next bottle insertion
+                    last_logged_event = None  # Ready to log new container encounters
 
                 status_text = "WAITING: Place 1 plastic bottle (keep hands clear)"
                 status_color = (180, 180, 180)

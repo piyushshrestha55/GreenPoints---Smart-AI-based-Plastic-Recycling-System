@@ -129,13 +129,34 @@ python test_custom_webcam.py 1
 ```
 
 ### Option C: Quick Model Verification (Standalone Predictor)
-To quickly test the raw detection predictions of `best.pt` without the HUD and anti-fraud state machine:
+To quickly test raw YOLO predictions of `best.pt` without the HUD or state machine:
 ```bash
-python predict_webcam.py
+python predict_webcam.py 0     # Laptop webcam
+# or
+python predict_webcam.py 1     # External / USB / DroidCam
 ```
 
 ### Controls
-- Press **Q** in the camera window to safely quit the program.
+- **Q**: Safely quit the video window.
+- **W**: Manually tag and log an incorrect decision frame to `logs/wrong/` with full metadata in `logs/events.csv` for failure audit and active retraining.
+
+---
+
+## Configuration & Tuning Parameters
+
+In `test_custom_webcam.py`, key system behaviors can be adjusted at the top of the file:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `REQUIRE_BASE_BOTTLE` | `True` | Requires Stage 1 COCO to identify object as `"bottle"` to prevent non-containers from earning points. |
+| `ALLOW_CUP_OVERRIDE` | `True` | Mitigates COCO labelling bottles as `"cup"` if Stage 2 specialist confidence is $\ge 90\%$. |
+| `ACCEPT_CONF` | `0.80` | High-confidence threshold needed to start and count the 8-frame acceptance streak. |
+| `MAX_WEAK_FRAMES` | `2` | Number of allowable consecutive frames dipping between 0.50 and 0.80 before resetting the streak. |
+| `USE_PLATFORM_ROI` | `True` | Restricts scanning and hand checks to the calibrated platform bounding polygon. |
+| `PLATFORM_POLYGON` | `[...]` | 4 polygon vertex percentages `(x, y)` defining the physical deposit tray outline. |
+| `FALLBACK_EVERY_N_FRAMES` | `5` | Runs full-frame Stage 2 aluminium can fallback every 5th frame to boost FPS on empty platforms. |
+| `STABLE_FRAMES` | `8` | Number of consecutive steady frames required before awarding points. |
+| `MISS_LIMIT` | `5` | Number of consecutive empty frames needed to reset the platform latch for the next bottle. |
 
 ---
 

@@ -9,7 +9,7 @@ def main():
     model = YOLO(init_weights)
 
     # 2. FINE-TUNE WITH OPTIMIZED SETTINGS
-    results = model.train(
+    _ = model.train(
         # The new dataset folder (contains the 1100 old + 37 new augmented images)
         data="datasets/greenpoints_v2/data.yaml", 
         
